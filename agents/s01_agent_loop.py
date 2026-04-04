@@ -82,9 +82,13 @@ def agent_loop(messages: list):
             if block.type == "tool_use":
                 print(f"\033[33m$ {block.input['command']}\033[0m")
                 output = run_bash(block.input["command"])
-                print(output[:200])
+                print(f"\033[35m{output[:1000]}\033[0m")
+                print()
                 results.append({"type": "tool_result", "tool_use_id": block.id,
-                                "content": output})
+                                "content": output})                              
+            elif block.type == "text":
+                print(block.text)
+
         messages.append({"role": "user", "content": results})
 
 

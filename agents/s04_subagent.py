@@ -155,12 +155,13 @@ def agent_loop(messages: list):
             if block.type == "tool_use":
                 if block.name == "task":
                     desc = block.input.get("description", "subtask")
-                    print(f"> task ({desc}): {block.input['prompt'][:80]}")
+                    print(f"\033[35m> task ({desc}): {block.input['prompt'][:80]}\033[0m\n")
                     output = run_subagent(block.input["prompt"])
+                    print(f"\033[90m  {str(output)[:200]}\033[0m\n")
                 else:
                     handler = TOOL_HANDLERS.get(block.name)
                     output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
-                print(f"  {str(output)[:200]}")
+                    print(f"\033[90m  {str(output)[:200]}\033[0m\n")
                 results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
         messages.append({"role": "user", "content": results})
 
