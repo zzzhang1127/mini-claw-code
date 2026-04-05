@@ -198,7 +198,8 @@ def agent_loop(ctx: dict):
         session.messages.append({"role": "assistant", "content": response.content})
         session.record_turn(response.usage)
 
-        if response.stop_reason != "tool_use":
+        has_tool_use = any(getattr(b, "type", None) == "tool_use" for b in response.content)
+        if not has_tool_use:
             for block in response.content:
                 if hasattr(block, "text"):
                     cprint(block.text, "purple")

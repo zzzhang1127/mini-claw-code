@@ -1,2 +1,8 @@
+# Core (src.main + agents tutorials using Anthropic client)
 anthropic>=0.25.0
 python-dotenv>=1.0.0
+
+# Optional: experimental MCP bridge (--mcp / /mcp in src.main)
+# pip install mcp httpx
+# mcp>=1.0.0
+# httpx>=0.27.0
