@@ -15,20 +15,47 @@ tools.py - 工具定义、处理函数、权限控制
 
 import json
 import subprocess
+import threading
 from pathlib import Path
 
 # 由 main.py 调用 init() 设置
 _client = None
 _model = None
 _workdir = None
+api_semaphore = threading.Semaphore(3)  # 全局 API 并发限制，默认 3
+print_lock = threading.Lock()
+_file_locks = {}
+_file_locks_guard = threading.Lock()
+
+COLORS = {"gray": "\033[90m", "purple": "\033[35m", "cyan": "\033[36m", "reset": "\033[0m"}
 
 
-def init(client, model, workdir):
+def get_file_lock(path: str) -> threading.Lock:
+    """获取指定文件路径的锁，不存在则创建。"""
+    key = str(Path(path).resolve())
+    with _file_locks_guard:
+        if key not in _file_locks:
+            _file_locks[key] = threading.Lock()
+        return _file_locks[key]
+
+
+def cprint(text: str, color: str = "", prefix: str = ""):
+    """线程安全的彩色输出。"""
+    line = f"{prefix}{text}" if prefix else text
+    with print_lock:
+        if color in COLORS:
+            print(f"{COLORS[color]}{line}{COLORS['reset']}")
+        else:
+            print(line)
+
+
+def init(client, model, workdir, max_concurrency=3):
     """由 main.py 在启动时调用，注入共享依赖。"""
-    global _client, _model, _workdir
+    global _client, _model, _workdir, api_semaphore
     _client = client
     _model = model
     _workdir = workdir
+    api_semaphore = threading.Semaphore(max_concurrency)
 
 
 # ── 路径安全 ─────────────────────────────────────────────────
@@ -52,7 +79,11 @@ def run_bash(command: str) -> str:
         r = subprocess.run(command, shell=True, cwd=_workdir,
                            capture_output=True, text=True, timeout=120)
         out = (r.stdout + r.stderr).strip()
-        return out[:50000] if out else "(no output)"
+        if not out:
+            return "(no output)"
+        if len(out) > 50000:
+            return out[:50000] + "\n... (truncated)"
+        return out
     except subprocess.TimeoutExpired:
         return "Error: Timeout (120s)"
 
@@ -60,7 +91,7 @@ def run_bash(command: str) -> str:
 def run_read(path: str, limit: int = None) -> str:
     """读取文件内容，可选行数限制。"""
     try:
-        lines = safe_path(path).read_text().splitlines()
+        lines = safe_path(path).read_text(encoding="utf-8").splitlines()
         if limit and limit < len(lines):
             lines = lines[:limit] + [f"... ({len(lines) - limit} more)"]
         return "\n".join(lines)[:50000]
@@ -73,7 +104,8 @@ def run_write(path: str, content: str) -> str:
     try:
         fp = safe_path(path)
         fp.parent.mkdir(parents=True, exist_ok=True)
-        fp.write_text(content)
+        with get_file_lock(str(fp)):
+            fp.write_text(content, encoding="utf-8")
         return f"Wrote {len(content)} bytes to {path}"
     except Exception as e:
         return f"Error: {e}"
@@ -83,10 +115,11 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
     """精确替换文件中的文本 (只替换第一次出现)。"""
     try:
         fp = safe_path(path)
-        c = fp.read_text()
-        if old_text not in c:
-            return f"Error: Text not found in {path}"
-        fp.write_text(c.replace(old_text, new_text, 1))
+        with get_file_lock(str(fp)):
+            c = fp.read_text(encoding="utf-8")
+            if old_text not in c:
+                return f"Error: Text not found in {path}"
+            fp.write_text(c.replace(old_text, new_text, 1))
         return f"Edited {path}"
     except Exception as e:
         return f"Error: {e}"

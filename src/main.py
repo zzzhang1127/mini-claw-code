@@ -21,6 +21,7 @@ import json
 import os
 import platform
 import sys
+import time
 from pathlib import Path
 
 from anthropic import Anthropic
@@ -30,7 +31,7 @@ from . import session as session_mod
 from . import tools as tools_mod
 from . import team as team_mod
 from . import commands as cmd_mod
-from .tools import get_active_tools
+from .tools import get_active_tools, cprint
 
 
 # ── 启动引导 (来自 claw-code/src/bootstrap_graph.py) ────────
@@ -170,18 +171,37 @@ def agent_loop(ctx: dict):
         # Step 5: 获取当前可用工具 (权限过滤 + MCP 工具)
         active_tools = get_active_tools(permission, ctx["extra_tools"])
 
-        # Step 6: LLM 调用
-        response = client.messages.create(
-            model=model,
-            system=ctx["system_prompt"],
-            messages=session.messages,
-            tools=active_tools,
-            max_tokens=8000,
-        )
+        # Step 6: LLM 调用（信号量限流 + 自动重试）
+        from .tools import api_semaphore
+        response = None
+        last_err = None
+        for attempt in range(3):
+            try:
+                with api_semaphore:
+                    response = client.messages.create(
+                        model=model,
+                        system=ctx["system_prompt"],
+                        messages=session.messages,
+                        tools=active_tools,
+                        max_tokens=8000,
+                    )
+                break
+            except Exception as e:
+                last_err = e
+                wait = 2 ** attempt
+                print(f"[API error, retry {attempt+1}/3 in {wait}s] {e}")
+                time.sleep(wait)
+        if response is None:
+            print(f"[API failed after 3 retries, skipping turn] {last_err}")
+            session.history.add("api_error", str(last_err))
+            return
         session.messages.append({"role": "assistant", "content": response.content})
         session.record_turn(response.usage)
 
         if response.stop_reason != "tool_use":
+            for block in response.content:
+                if hasattr(block, "text"):
+                    cprint(block.text, "purple")
             return
 
         # Step 7: 工具执行
@@ -200,7 +220,10 @@ def agent_loop(ctx: dict):
                         output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
                     except Exception as e:
                         output = f"Error: {e}"
-                print(f"> {block.name}: {str(output)[:200]}")
+                display = str(output)
+                if len(display) > 300:
+                    display = display[:300] + "... (truncated)"
+                cprint(f"> {block.name}: {display}", "gray")
                 results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
                 if block.name == "TodoWrite":
                     used_todo = True
@@ -216,6 +239,16 @@ def agent_loop(ctx: dict):
         if manual_compress:
             print("[manual compact]")
             session.do_manual_compact()
+
+
+# ── 等待所有后台工作完成 ──────────────────────────────────────
+
+def _wait_all_done(ctx):
+    """等待所有队友和后台任务完成，再交还控制权给用户。"""
+    team = ctx["team"]
+    bg = ctx["bg"]
+    while team.has_active() or bg.has_running():
+        time.sleep(0.5)
 
 
 # ── REPL 入口 ───────────────────────────────────────────────
@@ -238,6 +271,7 @@ def main():
 
         session.add_user_message(query)
         agent_loop(ctx)
+        _wait_all_done(ctx)
         print()
 
 

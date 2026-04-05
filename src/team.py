@@ -22,7 +22,7 @@ import uuid
 from pathlib import Path
 from queue import Queue
 
-from .tools import run_bash, run_read, run_write, run_edit
+from .tools import run_bash, run_read, run_write, run_edit, api_semaphore, get_file_lock, cprint
 
 # 由 main.py 调用 init() 设置
 _client = None
@@ -236,6 +236,9 @@ class BackgroundManager:
             notifs.append(self.notifications.get_nowait())
         return notifs
 
+    def has_running(self) -> bool:
+        return any(t["status"] == "running" for t in self.tasks.values())
+
 
 # ── 消息总线 (来自 s_full.py s09) ────────────────────────────
 
@@ -253,16 +256,19 @@ class MessageBus:
                "timestamp": time.time()}
         if extra:
             msg.update(extra)
-        with open(self.inbox_dir / f"{to}.jsonl", "a") as f:
-            f.write(json.dumps(msg) + "\n")
+        path = self.inbox_dir / f"{to}.jsonl"
+        with get_file_lock(str(path)):
+            with open(path, "a") as f:
+                f.write(json.dumps(msg) + "\n")
         return f"Sent {msg_type} to {to}"
 
     def read_inbox(self, name: str) -> list:
         path = self.inbox_dir / f"{name}.jsonl"
-        if not path.exists():
-            return []
-        msgs = [json.loads(line) for line in path.read_text().strip().splitlines() if line]
-        path.write_text("")
+        with get_file_lock(str(path)):
+            if not path.exists():
+                return []
+            msgs = [json.loads(line) for line in path.read_text().strip().splitlines() if line]
+            path.write_text("")
         return msgs
 
     def broadcast(self, sender: str, content: str, names: list) -> str:
@@ -354,10 +360,12 @@ class TeammateManager:
                         return
                     messages.append({"role": "user", "content": json.dumps(msg)})
                 try:
-                    response = _client.messages.create(
-                        model=_model, system=sys_prompt, messages=messages,
-                        tools=tools, max_tokens=8000)
-                except Exception:
+                    with api_semaphore:
+                        response = _client.messages.create(
+                            model=_model, system=sys_prompt, messages=messages,
+                            tools=tools, max_tokens=8000)
+                except Exception as e:
+                    cprint(f"API error: {str(e)[:100]}", "gray", f"  [{name}] ")
                     self._set_status(name, "shutdown")
                     return
                 messages.append({"role": "assistant", "content": response.content})
@@ -377,7 +385,7 @@ class TeammateManager:
                         else:
                             handler = dispatch.get(block.name, lambda **kw: "Unknown")
                             output = handler(**block.input)
-                        print(f"  [{name}] {block.name}: {str(output)[:120]}")
+                        cprint(f"{block.name}: {str(output)[:120]}", "gray", f"  [{name}] ")
                         results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
                 messages.append({"role": "user", "content": results})
                 if idle_requested:
@@ -428,6 +436,9 @@ class TeammateManager:
 
     def member_names(self) -> list:
         return [m["name"] for m in self.config["members"]]
+
+    def has_active(self) -> bool:
+        return any(m["status"] == "working" for m in self.config["members"])
 
     def handle_shutdown(self, teammate: str) -> str:
         """向队友发送关闭请求 (s10)。"""
