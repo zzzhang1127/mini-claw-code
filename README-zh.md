@@ -6,6 +6,8 @@
 
 本仓库是 [shareAI-lab/learn-claude-code](https://github.com/shareAI-lab/learn-claude-code) 的**精简发布**：只包含可运行的 **`src/`** 模块化 Harness，以及沿用上游目录结构的 **`skills/`**（通过 `load_skill` 按需加载 `SKILL.md`）。
 
+除上述来源外，命名与整体设计还**借鉴**了 [ultraworkers/claw-code](https://github.com/ultraworkers/claw-code)（公开的 Rust 版 `claw` CLI Agent 框架）。本仓库**并非** claw-code 的移植，而是在延续 learn-claude-code 脉络的同时，对 claw-code 的思路予以致谢与对齐。
+
 **本仓库实际包含的内容：**
 
 | 路径 | 说明 |

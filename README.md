@@ -6,6 +6,8 @@ Modular agent harness (`src/`) + upstream-style `skills/`.
 
 This repository is a **minimal slice** of ideas from [shareAI-lab/learn-claude-code](https://github.com/shareAI-lab/learn-claude-code): a **modular Python harness** in **`src/`**, plus the same **`skills/`** layout as upstream (on-demand `SKILL.md` loading via the `load_skill` tool).
 
+It also takes **naming and design cues** from [ultraworkers/claw-code](https://github.com/ultraworkers/claw-code) (the public Rust `claw` CLI agent harness). This repo is **not** a port of claw-code; it is Python reference-style code that complements the learn-claude-code lineage while acknowledging claw-code’s influence.
+
 **What this repo contains (by design):**
 
 | Path | Purpose |
