@@ -294,6 +294,14 @@ class TeammateManager:
         self.workdir = workdir
         self.config_path = self.team_dir / "config.json"
         self.config = self._load_config()
+        # 新进程内没有已启动的队友线程；磁盘上 working 是上次异常退出残留，否则 _wait_all_done 会永远等
+        dirty = False
+        for m in self.config.get("members", []):
+            if m.get("status") == "working":
+                m["status"] = "idle"
+                dirty = True
+        if dirty:
+            self._save_config()
 
     def _load_config(self) -> dict:
         if self.config_path.exists():

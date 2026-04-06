@@ -134,7 +134,7 @@ class Session:
     支持持久化保存和恢复。
     """
 
-    def __init__(self, max_turns=50, max_budget_tokens=500_000):
+    def __init__(self, max_turns=100, max_budget_tokens=500_000):
         self.session_id = uuid.uuid4().hex[:12]
         self.messages = []
         self.max_turns = max_turns

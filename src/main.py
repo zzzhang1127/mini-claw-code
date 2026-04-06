@@ -23,6 +23,7 @@ import platform
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 from anthropic import Anthropic
 from dotenv import load_dotenv
@@ -64,7 +65,12 @@ def bootstrap():
     bus = team_mod.MessageBus(workdir)
     team = team_mod.TeammateManager(bus, task_mgr, workdir)
     permission = tools_mod.ToolPermission()
-    sess = session_mod.Session()
+    try:
+        _mt = int(os.getenv("AGENT_MAX_TURNS", "50"))
+        _mb = int(os.getenv("AGENT_MAX_BUDGET_TOKENS", "500000"))
+    except ValueError:
+        _mt, _mb = 50, 500_000
+    sess = session_mod.Session(max_turns=_mt, max_budget_tokens=_mb)
 
     # Stage 4: 组装工具处理函数表
     handlers = tools_mod.build_handlers(todo, skills, task_mgr, bg, bus, team)
@@ -73,6 +79,10 @@ def bootstrap():
     # Stage 5: 构建 system prompt
     system_prompt = (
         f"You are a coding agent at {workdir}. Use tools to solve tasks.\n"
+        f"OS: {platform.platform()}. Use shell commands that exist on this OS "
+        f"(e.g. Windows has no sed/awk by default).\n"
+        f"Prefer read_file / edit_file / write_file over bash when editing code. "
+        f"Do not re-read the same file path without reason. Avoid no-op or empty shell commands.\n"
         f"Prefer task_create/task_update/task_list for multi-step work. "
         f"Use TodoWrite for short checklists.\n"
         f"Use task for subagent delegation. Use load_skill for specialized knowledge.\n"
@@ -122,6 +132,111 @@ def bootstrap():
         "mcp": mcp_bridge,
     }
     return ctx
+
+
+def _is_tool_use_block(block) -> bool:
+    if isinstance(block, dict):
+        return block.get("type") == "tool_use"
+    t = getattr(block, "type", None)
+    if t == "tool_use":
+        return True
+    return getattr(t, "value", None) == "tool_use"
+
+
+def _tool_use_id(block):
+    if isinstance(block, dict):
+        return block.get("id") or block.get("tool_call_id")
+    return getattr(block, "id", None) or getattr(block, "tool_call_id", None)
+
+
+def _parse_openai_tool_call(tc: dict) -> dict:
+    """OpenAI 风格 tool_calls 单项 -> Anthropic 风格 dict。"""
+    tid = tc.get("id")
+    fn = tc.get("function")
+    if isinstance(fn, dict):
+        name = fn.get("name") or "tool"
+        raw = fn.get("arguments") or "{}"
+    else:
+        name = tc.get("name") or "tool"
+        raw = tc.get("arguments") or "{}"
+    if isinstance(raw, str):
+        try:
+            inp = json.loads(raw)
+        except Exception:
+            inp = {}
+    else:
+        inp = raw if isinstance(raw, dict) else {}
+    return {"type": "tool_use", "id": tid, "name": name, "input": inp}
+
+
+def _tool_blocks_collect(sources: list) -> list:
+    """从多份 content / dump 合并所有 tool_use（去重 id）。"""
+    seen = set()
+    out = []
+
+    def add_block(b):
+        tid = _tool_use_id(b)
+        if tid is None:
+            return
+        tid = str(tid)
+        if tid in seen:
+            return
+        seen.add(tid)
+        if isinstance(b, dict):
+            inp = b.get("input")
+            out.append(SimpleNamespace(
+                type="tool_use",
+                id=tid,
+                name=b.get("name", "tool"),
+                input=inp if isinstance(inp, dict) else {},
+            ))
+        else:
+            inp = getattr(b, "input", None)
+            out.append(SimpleNamespace(
+                type="tool_use",
+                id=tid,
+                name=getattr(b, "name", "tool"),
+                input=inp if isinstance(inp, dict) else {},
+            ))
+
+    def walk_content_list(items):
+        if not isinstance(items, list):
+            return
+        for item in items:
+            if isinstance(item, dict):
+                t = item.get("type")
+                if t == "tool_use":
+                    add_block(item)
+                elif t == "tool_calls":
+                    for tc in item.get("tool_calls") or []:
+                        if isinstance(tc, dict):
+                            add_block(_parse_openai_tool_call(tc))
+            elif _is_tool_use_block(item):
+                add_block(item)
+
+    for src in sources:
+        if src is None:
+            continue
+        if isinstance(src, list):
+            walk_content_list(src)
+            continue
+        try:
+            dump = src.model_dump() if hasattr(src, "model_dump") else {}
+        except Exception:
+            dump = {}
+        walk_content_list(dump.get("content"))
+        for tc in dump.get("tool_calls") or []:
+            if isinstance(tc, dict):
+                add_block(_parse_openai_tool_call(tc))
+        for b in getattr(src, "content", None) or []:
+            if _is_tool_use_block(b):
+                add_block(b)
+    return out
+
+
+def _tool_blocks_for_turn(response, assistant_content) -> list:
+    """以即将写入历史的 assistant content 为准，合并 SDK + dump，避免漏并行调用。"""
+    return _tool_blocks_collect([assistant_content, response])
 
 
 # ── 主 Agent 循环 ───────────────────────────────────────────
@@ -198,8 +313,32 @@ def agent_loop(ctx: dict):
         session.messages.append({"role": "assistant", "content": response.content})
         session.record_turn(response.usage)
 
-        has_tool_use = any(getattr(b, "type", None) == "tool_use" for b in response.content)
-        if not has_tool_use:
+        # 若网关 model_dump 里 tool 多于 SDK content，用完整 content 写回上一条 assistant
+        try:
+            dump = response.model_dump() if hasattr(response, "model_dump") else {}
+            dcontent = dump.get("content")
+            if isinstance(dcontent, list):
+                def _count_tools(lst):
+                    n = 0
+                    for x in lst or []:
+                        if not isinstance(x, dict):
+                            continue
+                        if x.get("type") == "tool_use":
+                            n += 1
+                        elif x.get("type") == "tool_calls":
+                            n += len(x.get("tool_calls") or [])
+                    return n
+
+                n_dump = _count_tools(dcontent) + len(dump.get("tool_calls") or [])
+                n_sdk = sum(1 for b in (response.content or []) if _is_tool_use_block(b))
+                if n_dump > n_sdk:
+                    session.messages[-1] = {"role": "assistant", "content": dcontent}
+        except Exception:
+            pass
+
+        assistant_content = session.messages[-1]["content"]
+        tool_blocks = _tool_blocks_for_turn(response, assistant_content)
+        if not tool_blocks:
             for block in response.content:
                 if hasattr(block, "text"):
                     cprint(block.text, "purple")
@@ -209,30 +348,39 @@ def agent_loop(ctx: dict):
         results = []
         used_todo = False
         manual_compress = False
-        for block in response.content:
-            if block.type == "tool_use":
-                if block.name == "compress":
-                    manual_compress = True
-                if permission.blocks(block.name):
-                    output = f"Permission denied: {block.name}"
-                else:
-                    handler = handlers.get(block.name)
-                    try:
-                        output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
-                    except Exception as e:
-                        output = f"Error: {e}"
-                display = str(output)
-                if len(display) > 300:
-                    display = display[:300] + "... (truncated)"
-                cprint(f"> {block.name}: {display}", "gray")
-                results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
-                if block.name == "TodoWrite":
-                    used_todo = True
+        for block in tool_blocks:
+            name = block.name
+            tid = block.id
+            inp = block.input
+            if name == "compress":
+                manual_compress = True
+            if permission.blocks(name):
+                output = f"Permission denied: {name}"
+            else:
+                handler = handlers.get(name)
+                try:
+                    output = handler(**inp) if handler else f"Unknown tool: {name}"
+                except Exception as e:
+                    output = f"Error: {e}"
+            display = str(output)
+            if len(display) > 300:
+                display = display[:300] + "... (truncated)"
+            cprint(f"> {name}: {display}", "gray")
+            results.append({"type": "tool_result", "tool_use_id": str(tid), "content": str(output)})
+            if name == "TodoWrite":
+                used_todo = True
 
-        # Step 8: Todo 提醒 (s03)
+        seen_ids = {str(r["tool_use_id"]) for r in results if isinstance(r, dict) and r.get("type") == "tool_result"}
+        for block in tool_blocks:
+            tid = str(block.id) if block.id is not None else None
+            if tid is not None and tid not in seen_ids:
+                results.append({"type": "tool_result", "tool_use_id": tid, "content": "Error: missing tool output (parallel parse)."})
+                seen_ids.add(tid)
+
+        # Step 8: Todo 提醒 (s03) — 放在 tool_result 之后，避免兼容网关把首条 text 与 tool 配对弄乱
         rounds_without_todo = 0 if used_todo else rounds_without_todo + 1
         if todo.has_open_items() and rounds_without_todo >= 3:
-            results.insert(0, {"type": "text", "text": "<reminder>Update your todos.</reminder>"})
+            results.append({"type": "text", "text": "<reminder>Update your todos.</reminder>"})
 
         session.messages.append({"role": "user", "content": results})
 
@@ -244,11 +392,15 @@ def agent_loop(ctx: dict):
 
 # ── 等待所有后台工作完成 ──────────────────────────────────────
 
-def _wait_all_done(ctx):
+def _wait_all_done(ctx, timeout_sec=600.0):
     """等待所有队友和后台任务完成，再交还控制权给用户。"""
     team = ctx["team"]
     bg = ctx["bg"]
+    deadline = time.monotonic() + timeout_sec
     while team.has_active() or bg.has_running():
+        if time.monotonic() >= deadline:
+            print("\033[33m[wait timeout] returning to prompt; check .team/ or running background tasks.\033[0m")
+            break
         time.sleep(0.5)
 
 
